@@ -1,0 +1,141 @@
+# app.py
+# Main application for the AI-Based CCTV Network for Crowd Management
+
+import cv2
+import numpy as np
+from flask import Flask, render_template, Response
+
+# Initialize the Flask application
+app = Flask(__name__)
+
+# --- Configuration ---
+# Load the pre-trained MobileNet SSD model for person detection
+# This model is fast and suitable for real-time processing on a CPU.
+PROTOTXT = "MobileNetSSD_deploy.prototxt.txt"
+MODEL = "MobileNetSSD_deploy.caffemodel"
+net = cv2.dnn.readNetFromCaffe(PROTOTXT, MODEL)
+
+# Confidence threshold for detections
+CONFIDENCE_THRESHOLD = 0.4
+
+# Define the classes the model can detect. We are only interested in 'person'.
+CLASSES = ["background", "aeroplane", "bicycle", "bird", "boat",
+           "bottle", "bus", "car", "cat", "chair", "cow", "diningtable",
+           "dog", "horse", "motorbike", "person", "pottedplant", "sheep",
+           "sofa", "train", "tvmonitor"]
+
+# --- Crowd Density Logic ---
+def analyze_frame(frame):
+    """
+    Analyzes a single video frame to detect people and estimate crowd density.
+
+    Args:
+        frame: The input video frame (a NumPy array).
+
+    Returns:
+        A tuple containing:
+        - The processed frame with bounding boxes and density info.
+        - The number of people detected.
+    """
+    (h, w) = frame.shape[:2]
+    # Create a blob from the image to feed into the neural network
+    blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 0.007843, (300, 300), 127.5)
+
+    # Pass the blob through the network and get the detections
+    net.setInput(blob)
+    detections = net.forward()
+
+    person_count = 0
+
+    # Loop over the detections
+    for i in np.arange(0, detections.shape[2]):
+        confidence = detections[0, 0, i, 2]
+
+        # Filter out weak detections by ensuring the confidence is greater than the threshold
+        if confidence > CONFIDENCE_THRESHOLD:
+            idx = int(detections[0, 0, i, 1])
+
+            # Check if the detected object is a 'person'
+            if CLASSES[idx] == "person":
+                person_count += 1
+                box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+                (startX, startY, endX, endY) = box.astype("int")
+
+                # Draw the bounding box and label on the frame
+                label = f"Person: {confidence:.2f}"
+                cv2.rectangle(frame, (startX, startY), (endX, endY), (0, 255, 0), 2)
+                y = startY - 15 if startY - 15 > 15 else startY + 15
+                cv2.putText(frame, label, (startX, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+    # --- Density Level Assessment ---
+    # Determine the crowd density level based on the person count
+    density_text = "Density: "
+    if person_count < 5:
+        density_level = "Low"
+        color = (0, 255, 0)  # Green
+    elif person_count < 10:
+        density_level = "Medium"
+        color = (0, 255, 255) # Yellow
+    else:
+        density_level = "High"
+        color = (0, 0, 255) # Red
+
+    # Display the person count and density level on the frame
+    cv2.putText(frame, f"Person Count: {person_count}", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+    cv2.putText(frame, density_text + density_level, (10, 60),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+
+    return frame, person_count
+
+def generate_frames():
+    """
+    Generator function to capture video from the webcam, process it,
+    and yield it as a byte stream for the web response.
+    """
+    # Use 0 for the default webcam
+    camera = cv2.VideoCapture(0)
+
+    if not camera.isOpened():
+        print("Error: Could not open video stream.")
+        return
+
+    while True:
+        # Capture frame-by-frame
+        success, frame = camera.read()
+        if not success:
+            break
+        else:
+            # Analyze the frame for crowd density
+            processed_frame, _ = analyze_frame(frame)
+
+            # Encode the frame in JPEG format
+            ret, buffer = cv2.imencode('.jpg', processed_frame)
+            frame_bytes = buffer.tobytes()
+
+            # Yield the frame in the format required for a multipart response
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+
+    camera.release()
+
+# --- Flask Routes ---
+@app.route('/')
+def index():
+    """Render the main web page."""
+    return render_template('index.html')
+
+@app.route('/video_feed')
+def video_feed():
+    """Video streaming route. This will be the src of an img tag."""
+    return Response(generate_frames(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+# --- Main Execution ---
+if __name__ == '__main__':
+    # You will need to download these two files for the model:
+    # 1. MobileNetSSD_deploy.prototxt.txt
+    # 2. MobileNetSSD_deploy.caffemodel
+    # Place them in the same directory as app.py
+    # Links can be found in the README.
+    app.run(debug=True)
